@@ -1,0 +1,21 @@
+dependsOn: ['base']
+
+tasks:
+  test-small-ci:
+    command: 'test'
+    deps: ['base:build']
+    inputs: ['src.txt']
+  test-deep:
+    command: 'test-deep'
+    deps: ['app:test-small-ci']
+    inputs: ['src.txt']
+  test-always:
+    command: 'test-always'
+    inputs: ['src.txt']
+    options:
+      runInCI: always
+  test-never:
+    command: 'test-never'
+    inputs: ['src.txt']
+    options:
+      runInCI: false

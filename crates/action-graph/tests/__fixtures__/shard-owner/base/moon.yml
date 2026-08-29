@@ -1,0 +1,10 @@
+tasks:
+  build:
+    command: 'build'
+    inputs: ['src.txt']
+  check:
+    command: 'check'
+    inputs: ['src.txt']
+  lint:
+    command: 'lint'
+    inputs: ['src.txt']

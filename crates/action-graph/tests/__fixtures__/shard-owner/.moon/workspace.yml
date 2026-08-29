@@ -1,0 +1,6 @@
+projects:
+  - 'base'
+  - 'app'
+
+experiments:
+  asyncAffectedTracking: true

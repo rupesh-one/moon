@@ -227,6 +227,13 @@ export interface ExperimentsConfig {
 	 */
 	casOutputsCache: boolean;
 	/**
+	 * Deduplicate dependent expansion across sharded jobs.
+	 * @since 2.6.0
+	 *
+	 * @env MOON_EXPERIMENT_DEDUPE_SHARDED_DEPENDENTS
+	 */
+	dedupeShardedDependents: boolean;
+	/**
 	 * Use native file hashing instead of using the VCS.
 	 * @since 2.3.0
 	 *
@@ -950,6 +957,13 @@ export interface PartialExperimentsConfig {
 	 * @env MOON_EXPERIMENT_CAS_OUTPUTS_CACHE
 	 */
 	casOutputsCache?: boolean | null;
+	/**
+	 * Deduplicate dependent expansion across sharded jobs.
+	 * @since 2.6.0
+	 *
+	 * @env MOON_EXPERIMENT_DEDUPE_SHARDED_DEPENDENTS
+	 */
+	dedupeShardedDependents?: boolean | null;
 	/**
 	 * Use native file hashing instead of using the VCS.
 	 * @since 2.3.0

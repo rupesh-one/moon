@@ -13,8 +13,9 @@ use moon_exec_plan::{ExecutionPlan, GraphBlock, TargetsBlock};
 use moon_graph_utils::*;
 use moon_task::{Target, TargetLocator, Task, TaskFileInput};
 use moon_toolchain::ToolchainSpec;
-use rustc_hash::{FxHashMap, FxHashSet};
+use rustc_hash::{FxHashMap, FxHashSet, FxHasher};
 use starbase_sandbox::{assert_snapshot, create_sandbox};
+use std::hash::Hasher;
 use utils::ActionGraphContainer;
 
 fn create_task(project: &str, id: &str) -> Task {
@@ -3897,6 +3898,70 @@ mod action_graph_builder {
     mod run_tasks {
         use super::*;
 
+        const SHARD_TARGETS: [&str; 7] = [
+            "base:build",
+            "base:check",
+            "base:lint",
+            "app:test-small-ci",
+            "app:test-deep",
+            "app:test-always",
+            "app:test-never",
+        ];
+
+        async fn shard_targets(
+            changed: &[&str],
+            dedupe: bool,
+            job: Option<usize>,
+            job_total: Option<usize>,
+            skip_affected: bool,
+            ci_check: bool,
+        ) -> Vec<String> {
+            let sandbox = create_sandbox("shard-owner");
+            let mut container = ActionGraphContainer::new(sandbox.path());
+
+            container.mocker = container.mocker.update_workspace_config(|config| {
+                config.experiments.dedupe_sharded_dependents = dedupe;
+            });
+
+            let wg = container.create_workspace_graph().await;
+            let mut builder = container.create_builder(wg.clone()).await;
+
+            builder.mock_affected(
+                FxHashSet::from_iter(
+                    changed
+                        .iter()
+                        .map(|path| WorkspaceRelativePathBuf::from(*path)),
+                ),
+                |affected| {
+                    affected.set_scopes(UpstreamScope::Deep, DownstreamScope::Deep);
+                },
+            );
+
+            builder
+                .run_tasks(
+                    SHARD_TARGETS
+                        .iter()
+                        .map(|target| TargetLocator::Qualified(Target::parse(target).unwrap())),
+                    RunRequirements {
+                        ci: true,
+                        ci_check,
+                        dependencies: UpstreamScope::Deep,
+                        dependents: DownstreamScope::Deep,
+                        include_relations: true,
+                        job,
+                        job_total,
+                        skip_affected,
+                        ..Default::default()
+                    },
+                )
+                .await
+                .unwrap();
+
+            let (_, graph) = builder.build();
+
+            extract_run_task_targets(graph)
+        }
+
         #[tokio::test(flavor = "multi_thread")]
         async fn doesnt_partition_if_no_job() {
             let sandbox = create_sandbox("tasks");
@@ -3990,6 +4055,242 @@ mod action_graph_builder {
 
             assert_eq!(context.primary_targets.len(), 2);
             assert_snapshot!(graph.to_dot());
+        }
+
+        #[tokio::test(flavor = "multi_thread")]
+        async fn preserves_stock_expansion_when_dedupe_experiment_is_disabled() {
+            let changed = ["base/src.txt", "app/src.txt"];
+            let first: FxHashSet<_> =
+                shard_targets(&changed, false, Some(0), Some(2), false, false)
+                    .await
+                    .into_iter()
+                    .collect();
+            let second: FxHashSet<_> =
+                shard_targets(&changed, false, Some(1), Some(2), false, false)
+                    .await
+                    .into_iter()
+                    .collect();
+            let union_len = first.union(&second).count();
+
+            assert!(first.len() + second.len() > union_len);
+        }
+
+        #[tokio::test(flavor = "multi_thread")]
+        async fn preserves_unsharded_union_for_job_totals() {
+            let changed = ["base/src.txt", "app/src.txt"];
+            let unsharded: FxHashSet<_> = shard_targets(&changed, false, None, None, false, false)
+                .await
+                .into_iter()
+                .collect();
+
+            for job_total in 1..=6 {
+                let mut union = FxHashSet::default();
+
+                for job in 0..job_total {
+                    union.extend(
+                        shard_targets(&changed, true, Some(job), Some(job_total), false, false)
+                            .await,
+                    );
+                }
+
+                assert_eq!(union, unsharded, "job_total={job_total}");
+            }
+        }
+
+        #[tokio::test(flavor = "multi_thread")]
+        async fn enabled_shard_targets_are_a_subset_of_disabled_and_strictly_smaller_on_at_least_one_shard()
+         {
+            let changed = ["base/src.txt", "app/src.txt"];
+            let job_total = 3;
+            let mut found_smaller = false;
+
+            for job in 0..job_total {
+                let disabled: FxHashSet<_> =
+                    shard_targets(&changed, false, Some(job), Some(job_total), false, false)
+                        .await
+                        .into_iter()
+                        .collect();
+                let enabled: FxHashSet<_> =
+                    shard_targets(&changed, true, Some(job), Some(job_total), false, false)
+                        .await
+                        .into_iter()
+                        .collect();
+
+                assert!(enabled.is_subset(&disabled), "job={job}");
+                found_smaller |= enabled.len() < disabled.len();
+            }
+
+            assert!(found_smaller);
+        }
+
+        #[tokio::test(flavor = "multi_thread")]
+        async fn replays_deep_dependents_on_the_index_owner() {
+            let sandbox = create_sandbox("shard-owner");
+            let mut container = ActionGraphContainer::new(sandbox.path());
+            container.mocker = container.mocker.update_workspace_config(|config| {
+                config.experiments.dedupe_sharded_dependents = true;
+            });
+            let wg = container.create_workspace_graph().await;
+            let mut builder = container.create_builder(wg.clone()).await;
+
+            builder.mock_affected(
+                FxHashSet::from_iter([
+                    WorkspaceRelativePathBuf::from("base/src.txt"),
+                    WorkspaceRelativePathBuf::from("app/src.txt"),
+                ]),
+                |affected| {
+                    affected.set_scopes(UpstreamScope::Deep, DownstreamScope::Deep);
+                },
+            );
+
+            builder
+                .run_tasks(
+                    [
+                        TargetLocator::parse("base:build").unwrap(),
+                        TargetLocator::parse("app:test-small-ci").unwrap(),
+                    ],
+                    RunRequirements {
+                        dependencies: UpstreamScope::Deep,
+                        dependents: DownstreamScope::Deep,
+                        include_relations: true,
+                        job: Some(1),
+                        job_total: Some(2),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .unwrap();
+
+            let (_, graph) = builder.build();
+
+            assert!(extract_run_task_targets(graph).contains(&"app:test-deep".to_owned()));
+        }
+
+        #[tokio::test(flavor = "multi_thread")]
+        async fn does_not_suppress_relation_only_dependents() {
+            let changed = ["base/src.txt"];
+
+            for job in 0..3 {
+                assert_eq!(
+                    shard_targets(&changed, true, Some(job), Some(3), false, false).await,
+                    shard_targets(&changed, false, Some(job), Some(3), false, false).await,
+                    "job={job}"
+                );
+            }
+        }
+
+        #[tokio::test(flavor = "multi_thread")]
+        async fn is_a_noop_for_one_job() {
+            let changed = ["base/src.txt", "app/src.txt"];
+
+            assert_eq!(
+                shard_targets(&changed, true, Some(0), Some(1), false, false).await,
+                shard_targets(&changed, false, Some(0), Some(1), false, false).await
+            );
+        }
+
+        #[tokio::test(flavor = "multi_thread")]
+        async fn preserves_overrun_coverage_when_jobs_exceed_primaries() {
+            let changed = ["base/src.txt", "app/src.txt"];
+            let expected: FxHashSet<_> = shard_targets(&changed, false, None, None, false, false)
+                .await
+                .into_iter()
+                .collect();
+            let mut actual = FxHashSet::default();
+
+            for job in 0..9 {
+                actual
+                    .extend(shard_targets(&changed, true, Some(job), Some(9), false, false).await);
+            }
+
+            assert_eq!(actual, expected);
+        }
+
+        #[tokio::test(flavor = "multi_thread")]
+        async fn handles_shards_when_affected_checks_are_disabled() {
+            let changed = [];
+
+            for job in 0..3 {
+                let disabled =
+                    shard_targets(&changed, false, Some(job), Some(3), true, false).await;
+                let enabled = shard_targets(&changed, true, Some(job), Some(3), true, false).await;
+
+                assert!(
+                    enabled.iter().all(|target| disabled.contains(target)),
+                    "job={job}"
+                );
+            }
+        }
+
+        #[tokio::test(flavor = "multi_thread")]
+        async fn honors_run_in_ci_before_shard_deduplication() {
+            let targets = shard_targets(&[], true, Some(0), Some(1), true, true).await;
+
+            assert!(targets.contains(&"app:test-always".to_owned()));
+            assert!(!targets.contains(&"app:test-never".to_owned()));
+        }
+
+        #[tokio::test(flavor = "multi_thread")]
+        async fn clears_shard_suppression_after_run_tasks() {
+            let sandbox = create_sandbox("shard-owner");
+            let mut container = ActionGraphContainer::new(sandbox.path());
+            container.mocker = container.mocker.update_workspace_config(|config| {
+                config.experiments.dedupe_sharded_dependents = true;
+            });
+
+            let wg = container.create_workspace_graph().await;
+            let mut builder = container.create_builder(wg.clone()).await;
+            let dependent = Target::parse("app:test-small-ci").unwrap();
+            let mut hasher = FxHasher::default();
+            hasher.write(dependent.as_str().as_bytes());
+            let non_owner = (hasher.finish() as usize % 2 + 1) % 2;
+            let base = Target::parse("base:build").unwrap();
+            let locators = if non_owner == 0 {
+                vec![base.clone(), dependent.clone()]
+            } else {
+                vec![dependent.clone(), base.clone()]
+            };
+
+            builder.mock_affected(
+                FxHashSet::from_iter([
+                    WorkspaceRelativePathBuf::from("base/src.txt"),
+                    WorkspaceRelativePathBuf::from("app/src.txt"),
+                ]),
+                |affected| {
+                    affected.set_scopes(UpstreamScope::Deep, DownstreamScope::Deep);
+                },
+            );
+
+            builder
+                .run_tasks(
+                    locators.into_iter().map(TargetLocator::Qualified),
+                    RunRequirements {
+                        dependencies: UpstreamScope::Deep,
+                        dependents: DownstreamScope::None,
+                        include_relations: true,
+                        job: Some(non_owner),
+                        job_total: Some(2),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .unwrap();
+
+            let task = wg.get_task_from_project("base", "build").unwrap();
+            builder
+                .run_task(
+                    &task,
+                    &RunRequirements {
+                        dependents: DownstreamScope::Deep,
+                        ..Default::default()
+                    },
+                )
+                .await
+                .unwrap();
+
+            let (_, graph) = builder.build();
+
+            assert!(extract_run_task_targets(graph).contains(&dependent.to_string()));
         }
     }
 
@@ -5387,6 +5688,53 @@ mod action_graph_builder {
 
         mod partitioned_targets {
             use super::*;
+
+            async fn partitioned_plan_targets(dedupe: bool) -> Vec<String> {
+                let sandbox = create_sandbox("shard-owner");
+                let mut container = ActionGraphContainer::new(sandbox.path());
+                container.mocker = container.mocker.update_workspace_config(|config| {
+                    config.experiments.dedupe_sharded_dependents = dedupe;
+                });
+                let mut builder = container
+                    .create_builder(container.create_workspace_graph().await)
+                    .await;
+                let plan = ExecutionPlan {
+                    targets: TargetsBlock::Partitioned {
+                        jobs: vec![
+                            vec![TargetLocator::parse("base:build").unwrap()],
+                            vec![TargetLocator::parse("app:test-small-ci").unwrap()],
+                        ],
+                    },
+                    ..Default::default()
+                };
+
+                builder
+                    .run_tasks_with_plan(
+                        &plan,
+                        RunRequirements {
+                            dependencies: UpstreamScope::Deep,
+                            dependents: DownstreamScope::Deep,
+                            job: Some(0),
+                            job_total: Some(2),
+                            skip_affected: true,
+                            ..Default::default()
+                        },
+                    )
+                    .await
+                    .unwrap();
+
+                let (_, graph) = builder.build();
+
+                extract_run_task_targets(graph)
+            }
+
+            #[tokio::test(flavor = "multi_thread")]
+            async fn dedupe_experiment_is_inert_for_partitioned_plans() {
+                assert_eq!(
+                    partitioned_plan_targets(true).await,
+                    partitioned_plan_targets(false).await
+                );
+            }
 
             #[tokio::test(flavor = "multi_thread")]
             async fn runs_specific_job_partition() {

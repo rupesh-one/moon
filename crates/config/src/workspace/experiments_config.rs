@@ -20,6 +20,11 @@ config_struct!(
         #[setting(env = "MOON_EXPERIMENT_CAS_OUTPUTS_CACHE", parse_env = env::parse_bool)]
         pub cas_outputs_cache: bool,
 
+        /// Deduplicate dependent expansion across sharded jobs.
+        /// @since 2.6.0
+        #[setting(env = "MOON_EXPERIMENT_DEDUPE_SHARDED_DEPENDENTS", parse_env = env::parse_bool)]
+        pub dedupe_sharded_dependents: bool,
+
         /// Use native file hashing instead of using the VCS.
         /// @since 2.3.0
         #[setting(default = true, env = "MOON_EXPERIMENT_NATIVE_FILE_HASHING", parse_env = env::parse_bool)]

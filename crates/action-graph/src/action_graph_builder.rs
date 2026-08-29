@@ -21,8 +21,9 @@ use moon_toolchain::{DependenciesWorkspace, DependenciesWorkspaceRole, Toolchain
 use moon_workspace_graph::projects::ProjectGraphError;
 use moon_workspace_graph::{GraphConnections, WorkspaceGraph};
 use petgraph::prelude::*;
-use rustc_hash::{FxHashMap, FxHashSet};
+use rustc_hash::{FxHashMap, FxHashSet, FxHasher};
 use std::fmt::Debug;
+use std::hash::Hasher;
 use std::mem;
 use std::sync::Arc;
 use tracing::{debug, instrument, trace};
@@ -49,6 +50,14 @@ macro_rules! insert_node_or_exit {
             None => $builder.insert_node(node),
         }
     }};
+}
+
+fn get_shard_owner(target: &Target, job_total: usize) -> usize {
+    // FxHasher only coordinates jobs within one moon binary. Assignments may
+    // change after a moon or rustc-hash upgrade.
+    let mut hasher = FxHasher::default();
+    hasher.write(target.as_str().as_bytes());
+    hasher.finish() as usize % job_total
 }
 
 #[derive(Clone, Debug)]
@@ -142,6 +151,7 @@ pub struct ActionGraphBuilder<'query> {
     // Consumed when the task is revisited with dependents in scope, since the
     // node-exists early return would otherwise skip the expansion entirely.
     ignored_dependents: FxHashSet<Target>,
+    non_owned_sharded_primaries: FxHashSet<Target>,
     passthrough_targets: FxHashSet<Target>,
     primary_targets: FxHashSet<Target>,
 
@@ -169,6 +179,7 @@ impl<'query> ActionGraphBuilder<'query> {
             options,
             ignored_dependencies: FxHashMap::default(),
             ignored_dependents: FxHashSet::default(),
+            non_owned_sharded_primaries: FxHashSet::default(),
             passthrough_targets: FxHashSet::default(),
             primary_targets: FxHashSet::default(),
             serial_edges: FxHashSet::default(),
@@ -602,6 +613,23 @@ impl<'query> ActionGraphBuilder<'query> {
         locators: I,
         reqs: RunRequirements,
     ) -> miette::Result<RunPartition> {
+        self.non_owned_sharded_primaries.clear();
+
+        let result = self.internal_run_tasks(locators, reqs).await;
+
+        self.non_owned_sharded_primaries.clear();
+
+        result
+    }
+
+    async fn internal_run_tasks<
+        I: IntoIterator<Item = T> + Debug,
+        T: AsRef<TargetLocator> + Debug,
+    >(
+        &mut self,
+        locators: I,
+        reqs: RunRequirements,
+    ) -> miette::Result<RunPartition> {
         let mut tasks = vec![];
         let mut partition = RunPartition::default();
 
@@ -668,6 +696,27 @@ impl<'query> ActionGraphBuilder<'query> {
                 }
 
                 tasks = new_tasks;
+            }
+
+            if self
+                .app_context
+                .workspace_config
+                .experiments
+                .dedupe_sharded_dependents
+            {
+                let skip_candidates: FxHashSet<Target> = match &self.affected {
+                    Some(affected) if !reqs.skip_affected => tasks
+                        .iter()
+                        .filter(|task| affected.is_task_marked_ignoring_relations(task))
+                        .map(|task| task.target.clone())
+                        .collect(),
+                    _ => tasks.iter().map(|task| task.target.clone()).collect(),
+                };
+
+                self.non_owned_sharded_primaries = skip_candidates
+                    .into_iter()
+                    .filter(|target| get_shard_owner(target, job_total) != job_index)
+                    .collect();
             }
 
             // Then slice and partition the tasks based on the job index and total
@@ -816,6 +865,10 @@ impl<'query> ActionGraphBuilder<'query> {
                 .internal_resolve_tasks_from_target(&dep_target, true)
                 .await?
             {
+                if self.non_owned_sharded_primaries.contains(&dep_task.target) {
+                    continue;
+                }
+
                 // Dependent chains reset the marker, so that deep scopes
                 // keep cascading through transitive dependents
                 let mut dep_state = state.clone();
