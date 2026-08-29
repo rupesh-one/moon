@@ -3908,14 +3908,19 @@ mod action_graph_builder {
             "app:test-never",
         ];
 
-        async fn shard_targets(
+        struct ShardGraph {
+            primaries: FxHashSet<String>,
+            run_targets: FxHashSet<String>,
+        }
+
+        async fn shard_graph(
             changed: &[&str],
             dedupe: bool,
             job: Option<usize>,
             job_total: Option<usize>,
             skip_affected: bool,
             ci_check: bool,
-        ) -> Vec<String> {
+        ) -> ShardGraph {
             let sandbox = create_sandbox("shard-owner");
             let mut container = ActionGraphContainer::new(sandbox.path());
 
@@ -3957,9 +3962,16 @@ mod action_graph_builder {
                 .await
                 .unwrap();
 
-            let (_, graph) = builder.build();
+            let (context, graph) = builder.build();
 
-            extract_run_task_targets(graph)
+            ShardGraph {
+                primaries: context
+                    .primary_targets
+                    .into_iter()
+                    .map(|target| target.to_string())
+                    .collect(),
+                run_targets: extract_run_task_targets(graph).into_iter().collect(),
+            }
         }
 
         #[tokio::test(flavor = "multi_thread")]
@@ -4060,16 +4072,12 @@ mod action_graph_builder {
         #[tokio::test(flavor = "multi_thread")]
         async fn preserves_stock_expansion_when_dedupe_experiment_is_disabled() {
             let changed = ["base/src.txt", "app/src.txt"];
-            let first: FxHashSet<_> =
-                shard_targets(&changed, false, Some(0), Some(2), false, false)
-                    .await
-                    .into_iter()
-                    .collect();
-            let second: FxHashSet<_> =
-                shard_targets(&changed, false, Some(1), Some(2), false, false)
-                    .await
-                    .into_iter()
-                    .collect();
+            let first = shard_graph(&changed, false, Some(0), Some(2), false, false)
+                .await
+                .run_targets;
+            let second = shard_graph(&changed, false, Some(1), Some(2), false, false)
+                .await
+                .run_targets;
             let union_len = first.union(&second).count();
 
             assert!(first.len() + second.len() > union_len);
@@ -4078,18 +4086,18 @@ mod action_graph_builder {
         #[tokio::test(flavor = "multi_thread")]
         async fn preserves_unsharded_union_for_job_totals() {
             let changed = ["base/src.txt", "app/src.txt"];
-            let unsharded: FxHashSet<_> = shard_targets(&changed, false, None, None, false, false)
+            let unsharded = shard_graph(&changed, false, None, None, false, false)
                 .await
-                .into_iter()
-                .collect();
+                .run_targets;
 
             for job_total in 1..=6 {
                 let mut union = FxHashSet::default();
 
                 for job in 0..job_total {
                     union.extend(
-                        shard_targets(&changed, true, Some(job), Some(job_total), false, false)
-                            .await,
+                        shard_graph(&changed, true, Some(job), Some(job_total), false, false)
+                            .await
+                            .run_targets,
                     );
                 }
 
@@ -4105,19 +4113,17 @@ mod action_graph_builder {
             let mut found_smaller = false;
 
             for job in 0..job_total {
-                let disabled: FxHashSet<_> =
-                    shard_targets(&changed, false, Some(job), Some(job_total), false, false)
-                        .await
-                        .into_iter()
-                        .collect();
-                let enabled: FxHashSet<_> =
-                    shard_targets(&changed, true, Some(job), Some(job_total), false, false)
-                        .await
-                        .into_iter()
-                        .collect();
+                let disabled =
+                    shard_graph(&changed, false, Some(job), Some(job_total), false, false).await;
+                let enabled =
+                    shard_graph(&changed, true, Some(job), Some(job_total), false, false).await;
 
-                assert!(enabled.is_subset(&disabled), "job={job}");
-                found_smaller |= enabled.len() < disabled.len();
+                assert_eq!(enabled.primaries, disabled.primaries, "job={job}");
+                assert!(
+                    enabled.run_targets.is_subset(&disabled.run_targets),
+                    "job={job}"
+                );
+                found_smaller |= enabled.run_targets.len() < disabled.run_targets.len();
             }
 
             assert!(found_smaller);
@@ -4143,17 +4149,39 @@ mod action_graph_builder {
                 },
             );
 
+            let dependent = Target::parse("app:test-small-ci").unwrap();
+            let mut hasher = FxHasher::default();
+            hasher.write(dependent.as_str().as_bytes());
+            let owner = hasher.finish() as usize % 2;
+            let base = TargetLocator::parse("base:build").unwrap();
+            let small = TargetLocator::parse("app:test-small-ci").unwrap();
+            let locators = if owner == 0 {
+                vec![base, small]
+            } else {
+                vec![small, base]
+            };
+
+            let task = wg.get_task_from_project("base", "build").unwrap();
+            builder
+                .run_task(
+                    &task,
+                    &RunRequirements {
+                        dependencies: UpstreamScope::Deep,
+                        dependents: DownstreamScope::None,
+                        ..RunRequirements::default()
+                    },
+                )
+                .await
+                .unwrap();
+
             builder
                 .run_tasks(
-                    [
-                        TargetLocator::parse("base:build").unwrap(),
-                        TargetLocator::parse("app:test-small-ci").unwrap(),
-                    ],
+                    locators,
                     RunRequirements {
                         dependencies: UpstreamScope::Deep,
                         dependents: DownstreamScope::Deep,
                         include_relations: true,
-                        job: Some(1),
+                        job: Some(owner),
                         job_total: Some(2),
                         ..Default::default()
                     },
@@ -4161,8 +4189,14 @@ mod action_graph_builder {
                 .await
                 .unwrap();
 
-            let (_, graph) = builder.build();
+            let (context, graph) = builder.build();
+            let primaries: Vec<String> = context
+                .primary_targets
+                .into_iter()
+                .map(|target| target.to_string())
+                .collect();
 
+            assert!(!primaries.iter().any(|target| target == "app:test-deep"));
             assert!(extract_run_task_targets(graph).contains(&"app:test-deep".to_owned()));
         }
 
@@ -4171,36 +4205,38 @@ mod action_graph_builder {
             let changed = ["base/src.txt"];
 
             for job in 0..3 {
-                assert_eq!(
-                    shard_targets(&changed, true, Some(job), Some(3), false, false).await,
-                    shard_targets(&changed, false, Some(job), Some(3), false, false).await,
-                    "job={job}"
-                );
+                let enabled = shard_graph(&changed, true, Some(job), Some(3), false, false).await;
+                let disabled = shard_graph(&changed, false, Some(job), Some(3), false, false).await;
+
+                assert_eq!(enabled.primaries, disabled.primaries, "job={job}");
+                assert_eq!(enabled.run_targets, disabled.run_targets, "job={job}");
             }
         }
 
         #[tokio::test(flavor = "multi_thread")]
         async fn is_a_noop_for_one_job() {
             let changed = ["base/src.txt", "app/src.txt"];
+            let enabled = shard_graph(&changed, true, Some(0), Some(1), false, false).await;
+            let disabled = shard_graph(&changed, false, Some(0), Some(1), false, false).await;
 
-            assert_eq!(
-                shard_targets(&changed, true, Some(0), Some(1), false, false).await,
-                shard_targets(&changed, false, Some(0), Some(1), false, false).await
-            );
+            assert_eq!(enabled.primaries, disabled.primaries);
+            assert_eq!(enabled.run_targets, disabled.run_targets);
         }
 
         #[tokio::test(flavor = "multi_thread")]
         async fn preserves_overrun_coverage_when_jobs_exceed_primaries() {
             let changed = ["base/src.txt", "app/src.txt"];
-            let expected: FxHashSet<_> = shard_targets(&changed, false, None, None, false, false)
+            let expected = shard_graph(&changed, false, None, None, false, false)
                 .await
-                .into_iter()
-                .collect();
+                .run_targets;
             let mut actual = FxHashSet::default();
 
             for job in 0..9 {
-                actual
-                    .extend(shard_targets(&changed, true, Some(job), Some(9), false, false).await);
+                actual.extend(
+                    shard_graph(&changed, true, Some(job), Some(9), false, false)
+                        .await
+                        .run_targets,
+                );
             }
 
             assert_eq!(actual, expected);
@@ -4209,25 +4245,36 @@ mod action_graph_builder {
         #[tokio::test(flavor = "multi_thread")]
         async fn handles_shards_when_affected_checks_are_disabled() {
             let changed = [];
+            let unsharded = shard_graph(&changed, false, None, None, true, false)
+                .await
+                .run_targets;
+            let mut union = FxHashSet::default();
 
             for job in 0..3 {
-                let disabled =
-                    shard_targets(&changed, false, Some(job), Some(3), true, false).await;
-                let enabled = shard_targets(&changed, true, Some(job), Some(3), true, false).await;
+                let disabled = shard_graph(&changed, false, Some(job), Some(3), true, false).await;
+                let enabled = shard_graph(&changed, true, Some(job), Some(3), true, false).await;
 
-                assert!(
-                    enabled.iter().all(|target| disabled.contains(target)),
-                    "job={job}"
-                );
+                assert_eq!(enabled.primaries, disabled.primaries, "job={job}");
+                union.extend(enabled.run_targets);
             }
+
+            assert_eq!(union, unsharded);
         }
 
         #[tokio::test(flavor = "multi_thread")]
         async fn honors_run_in_ci_before_shard_deduplication() {
-            let targets = shard_targets(&[], true, Some(0), Some(1), true, true).await;
+            let mut union = FxHashSet::default();
 
-            assert!(targets.contains(&"app:test-always".to_owned()));
-            assert!(!targets.contains(&"app:test-never".to_owned()));
+            for job in 0..3 {
+                union.extend(
+                    shard_graph(&[], true, Some(job), Some(3), true, true)
+                        .await
+                        .run_targets,
+                );
+            }
+
+            assert!(union.contains("app:test-always"));
+            assert!(!union.contains("app:test-never"));
         }
 
         #[tokio::test(flavor = "multi_thread")]
