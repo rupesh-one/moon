@@ -21,9 +21,8 @@ use moon_toolchain::{DependenciesWorkspace, DependenciesWorkspaceRole, Toolchain
 use moon_workspace_graph::projects::ProjectGraphError;
 use moon_workspace_graph::{GraphConnections, WorkspaceGraph};
 use petgraph::prelude::*;
-use rustc_hash::{FxHashMap, FxHashSet, FxHasher};
+use rustc_hash::{FxHashMap, FxHashSet};
 use std::fmt::Debug;
-use std::hash::Hasher;
 use std::mem;
 use std::sync::Arc;
 use tracing::{debug, instrument, trace};
@@ -50,14 +49,6 @@ macro_rules! insert_node_or_exit {
             None => $builder.insert_node(node),
         }
     }};
-}
-
-fn get_shard_owner(target: &Target, job_total: usize) -> usize {
-    // FxHasher only coordinates jobs within one moon binary. Assignments may
-    // change after a moon or rustc-hash upgrade.
-    let mut hasher = FxHasher::default();
-    hasher.write(target.as_str().as_bytes());
-    hasher.finish() as usize % job_total
 }
 
 #[derive(Clone, Debug)]
@@ -698,28 +689,6 @@ impl<'query> ActionGraphBuilder<'query> {
                 tasks = new_tasks;
             }
 
-            if self
-                .app_context
-                .workspace_config
-                .experiments
-                .dedupe_sharded_dependents
-            {
-                let skip_candidates: FxHashSet<Target> = match &self.affected {
-                    Some(affected) if !reqs.skip_affected => tasks
-                        .iter()
-                        .filter(|task| affected.is_task_marked_ignoring_relations(task))
-                        .map(|task| task.target.clone())
-                        .collect(),
-                    _ => tasks.iter().map(|task| task.target.clone()).collect(),
-                };
-
-                self.non_owned_sharded_primaries = skip_candidates
-                    .into_iter()
-                    .filter(|target| get_shard_owner(target, job_total) != job_index)
-                    .collect();
-            }
-
-            // Then slice and partition the tasks based on the job index and total
             let size = tasks.len().div_ceil(job_total);
             let (start, stop) =
                 // beginning
@@ -735,6 +704,36 @@ impl<'query> ActionGraphBuilder<'query> {
                     ((size * job_index), (size * (job_index + 1)))
                 };
 
+            if self
+                .app_context
+                .workspace_config
+                .experiments
+                .dedupe_sharded_dependents
+            {
+                let owned_targets: FxHashSet<Target> = if start < tasks.len() {
+                    tasks[start..stop.min(tasks.len())]
+                        .iter()
+                        .map(|task| task.target.clone())
+                        .collect()
+                } else {
+                    tasks.iter().map(|task| task.target.clone()).collect()
+                };
+                let skip_candidates: FxHashSet<Target> = match &self.affected {
+                    Some(affected) if !reqs.skip_affected => tasks
+                        .iter()
+                        .filter(|task| affected.is_task_marked_ignoring_relations(task))
+                        .map(|task| task.target.clone())
+                        .collect(),
+                    _ => tasks.iter().map(|task| task.target.clone()).collect(),
+                };
+
+                self.non_owned_sharded_primaries = skip_candidates
+                    .into_iter()
+                    .filter(|target| !owned_targets.contains(target))
+                    .collect();
+            }
+
+            // Then slice and partition the tasks based on the job index and total
             if tasks.get(start).is_some() {
                 if tasks.get(stop).is_some() {
                     tasks = tasks[start..stop].to_vec();

@@ -13,9 +13,8 @@ use moon_exec_plan::{ExecutionPlan, GraphBlock, TargetsBlock};
 use moon_graph_utils::*;
 use moon_task::{Target, TargetLocator, Task, TaskFileInput};
 use moon_toolchain::ToolchainSpec;
-use rustc_hash::{FxHashMap, FxHashSet, FxHasher};
+use rustc_hash::{FxHashMap, FxHashSet};
 use starbase_sandbox::{assert_snapshot, create_sandbox};
-use std::hash::Hasher;
 use utils::ActionGraphContainer;
 
 fn create_task(project: &str, id: &str) -> Task {
@@ -4084,6 +4083,43 @@ mod action_graph_builder {
         }
 
         #[tokio::test(flavor = "multi_thread")]
+        async fn aligns_dependent_ownership_with_uneven_positional_shards() {
+            let changed = ["base/src.txt", "app/src.txt"];
+            let expected = [
+                (
+                    ["base:build", "base:check", "base:lint", "app:test-small-ci"].as_slice(),
+                    ["base:build", "base:check", "base:lint", "app:test-small-ci"].as_slice(),
+                ),
+                (
+                    ["app:test-deep", "app:test-always", "app:test-never"].as_slice(),
+                    [
+                        "base:build",
+                        "app:test-small-ci",
+                        "app:test-deep",
+                        "app:test-always",
+                        "app:test-never",
+                    ]
+                    .as_slice(),
+                ),
+            ];
+
+            for (job, (primary_targets, run_targets)) in expected.into_iter().enumerate() {
+                let shard = shard_graph(&changed, true, Some(job), Some(2), false, false).await;
+
+                assert_eq!(
+                    shard.primaries,
+                    primary_targets.iter().map(ToString::to_string).collect(),
+                    "job={job}"
+                );
+                assert_eq!(
+                    shard.run_targets,
+                    run_targets.iter().map(ToString::to_string).collect(),
+                    "job={job}"
+                );
+            }
+        }
+
+        #[tokio::test(flavor = "multi_thread")]
         async fn preserves_unsharded_union_for_job_totals() {
             let changed = ["base/src.txt", "app/src.txt"];
             let unsharded = shard_graph(&changed, false, None, None, false, false)
@@ -4130,7 +4166,7 @@ mod action_graph_builder {
         }
 
         #[tokio::test(flavor = "multi_thread")]
-        async fn replays_deep_dependents_on_the_index_owner() {
+        async fn replays_deep_dependents_on_the_positional_owner() {
             let sandbox = create_sandbox("shard-owner");
             let mut container = ActionGraphContainer::new(sandbox.path());
             container.mocker = container.mocker.update_workspace_config(|config| {
@@ -4149,17 +4185,8 @@ mod action_graph_builder {
                 },
             );
 
-            let dependent = Target::parse("app:test-small-ci").unwrap();
-            let mut hasher = FxHasher::default();
-            hasher.write(dependent.as_str().as_bytes());
-            let owner = hasher.finish() as usize % 2;
             let base = TargetLocator::parse("base:build").unwrap();
             let small = TargetLocator::parse("app:test-small-ci").unwrap();
-            let locators = if owner == 0 {
-                vec![base, small]
-            } else {
-                vec![small, base]
-            };
 
             let task = wg.get_task_from_project("base", "build").unwrap();
             builder
@@ -4176,12 +4203,12 @@ mod action_graph_builder {
 
             builder
                 .run_tasks(
-                    locators,
+                    vec![base, small],
                     RunRequirements {
                         dependencies: UpstreamScope::Deep,
                         dependents: DownstreamScope::Deep,
                         include_relations: true,
-                        job: Some(owner),
+                        job: Some(1),
                         job_total: Some(2),
                         ..Default::default()
                     },
@@ -4288,15 +4315,7 @@ mod action_graph_builder {
             let wg = container.create_workspace_graph().await;
             let mut builder = container.create_builder(wg.clone()).await;
             let dependent = Target::parse("app:test-small-ci").unwrap();
-            let mut hasher = FxHasher::default();
-            hasher.write(dependent.as_str().as_bytes());
-            let non_owner = (hasher.finish() as usize % 2 + 1) % 2;
             let base = Target::parse("base:build").unwrap();
-            let locators = if non_owner == 0 {
-                vec![base.clone(), dependent.clone()]
-            } else {
-                vec![dependent.clone(), base.clone()]
-            };
 
             builder.mock_affected(
                 FxHashSet::from_iter([
@@ -4310,12 +4329,14 @@ mod action_graph_builder {
 
             builder
                 .run_tasks(
-                    locators.into_iter().map(TargetLocator::Qualified),
+                    [dependent.clone(), base]
+                        .into_iter()
+                        .map(TargetLocator::Qualified),
                     RunRequirements {
                         dependencies: UpstreamScope::Deep,
                         dependents: DownstreamScope::None,
                         include_relations: true,
-                        job: Some(non_owner),
+                        job: Some(1),
                         job_total: Some(2),
                         ..Default::default()
                     },
