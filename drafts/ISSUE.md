@@ -6,13 +6,15 @@
 
 Issue #2147 described duplicate work in the previous CI implementation. That issue is closed, but the `job` and `job_total` path can produce a related result in the current action graph.
 
+A first experiment used a hash owner that did not match the contiguous primary slice. Remainder shards then expanded another shard's primaries as dependents. Ownership must use the same positional range as primary placement.
+
 ## Proposed experiment
 
 Add a default-off `experiments.dedupeShardedDependents` experiment.
 
-The experiment would keep the existing contiguous, index-based partition for primary starts. It would assign each primary target a deterministic hash owner and suppress that target only when another shard reaches it through dependent expansion.
+The experiment keeps the existing contiguous, index-based partition for primary starts. It treats that same slice as the owner set. A shard suppresses a primary only when another shard owns that primary and this shard reaches it through dependent expansion.
 
-The experiment would not:
+The experiment does not:
 
 - change which primary targets a shard starts;
 - suppress dependency expansion;
@@ -20,7 +22,7 @@ The experiment would not:
 - provide a global exactly-once guarantee;
 - change partitioned execution-plan behavior.
 
-The hash owner would coordinate shards from the same Moon binary. Target ownership would not be stable across Moon or hash-library versions.
+Required dependencies can still run on more than one shard when cache state requires them.
 
 ## Configuration
 
@@ -29,7 +31,7 @@ experiments:
   dedupeShardedDependents: true
 ```
 
-The equivalent environment variable would be:
+The equivalent environment variable is:
 
 ```text
 MOON_EXPERIMENT_DEDUPE_SHARDED_DEPENDENTS=true
@@ -42,10 +44,12 @@ MOON_EXPERIMENT_DEDUPE_SHARDED_DEPENDENTS=true
 - For job totals from 1 through 6, the union of enabled shard targets matches the unsharded target set.
 - Each enabled shard target set is a subset of the same shard with the experiment disabled.
 - At least one shard removes duplicate dependent work in a graph that has overlapping downstream expansion.
+- Dependent suppression uses the same contiguous slice as primary placement, including remainder shards.
 - A one-job run is unchanged.
 - Over-partitioning does not remove target coverage.
 - Deep dependent replay remains compatible with #2613.
 - Partitioned execution plans produce the same graph with the experiment enabled or disabled.
+- Required non-cacheable and cache-miss dependencies can still execute on shards that do not own them as primaries.
 
 ## Related work
 
