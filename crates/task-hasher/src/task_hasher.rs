@@ -11,7 +11,7 @@ use moon_task::{Target, Task};
 use rustc_hash::{FxHashMap, FxHashSet};
 use starbase_utils::glob::GlobSet;
 use std::path::PathBuf;
-use tracing::{debug, warn};
+use tracing::{debug, instrument, warn};
 
 // Hash all inputs for a task, but exclude outputs and moon specific configuration files!
 pub struct TaskHasher<'task> {
@@ -67,6 +67,7 @@ impl<'task> TaskHasher<'task> {
         }
     }
 
+    #[instrument(skip_all)]
     pub async fn hash_inputs(&mut self) -> miette::Result<()> {
         let absolute_inputs = self.aggregate_inputs().await?;
         let processed_inputs = self.process_inputs(absolute_inputs)?;
@@ -90,6 +91,7 @@ impl<'task> TaskHasher<'task> {
         Ok(())
     }
 
+    #[instrument(skip_all)]
     async fn aggregate_inputs(&mut self) -> miette::Result<FxHashSet<PathBuf>> {
         let mut files = FxHashSet::default();
         let vcs_enabled = self.app_context.vcs.is_enabled();
@@ -200,6 +202,7 @@ impl<'task> TaskHasher<'task> {
             || sources_globset.matches(workspace_relative_path.as_str())
     }
 
+    #[instrument(skip_all)]
     fn process_inputs(
         &mut self,
         inputs: FxHashSet<PathBuf>,

@@ -19,7 +19,7 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::task::JoinSet;
-use tracing::{debug, warn};
+use tracing::{debug, instrument, warn};
 use version_spec::Version;
 
 fn get_repository_root(common_dir: &Path) -> PathBuf {
@@ -500,6 +500,7 @@ impl Vcs for Git {
         Err(GitError::ExtractRepoSlugFailed.into())
     }
 
+    #[instrument(skip_all)]
     async fn get_changed_files(&self) -> miette::Result<ChangedFiles> {
         let mut changed_files = ChangedFiles::default();
         let mut set = JoinSet::new();

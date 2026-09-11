@@ -6,6 +6,7 @@ use std::fmt;
 use std::hash::Hash;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
+use tracing::instrument;
 
 #[derive(Debug, Default, Eq, PartialEq)]
 pub struct ChangedFiles<T: Hash + Eq + PartialEq = WorkspaceRelativePathBuf> {
@@ -62,6 +63,7 @@ impl<T: Hash + Eq + PartialEq> ChangedFiles<T> {
 }
 
 impl ChangedFiles<PathBuf> {
+    #[instrument(skip_all)]
     pub fn into_workspace_relative(
         self,
         workspace_root: &Path,

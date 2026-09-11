@@ -20,7 +20,9 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::task::JoinSet;
+use tracing::instrument;
 
+#[instrument(skip_all)]
 pub async fn hash_common_task_contents(
     app_context: &AppContext,
     action_context: &ActionContext,
@@ -115,6 +117,7 @@ fingerprint!(
     }
 );
 
+#[instrument(skip_all)]
 pub async fn hash_toolchain_task_contents(
     app_context: &Arc<AppContext>,
     project: &Project,
@@ -166,6 +169,7 @@ pub async fn hash_toolchain_task_contents(
     Ok(())
 }
 
+#[instrument(skip_all)]
 async fn apply_toolchain(
     app_context: Arc<AppContext>,
     toolchain: Arc<ToolchainPlugin>,
@@ -233,6 +237,7 @@ async fn apply_toolchain(
     Ok(if inject { Some(fingerprint) } else { None })
 }
 
+#[instrument(skip_all)]
 async fn apply_toolchain_dependencies(
     app_context: &AppContext,
     toolchain: &ToolchainPlugin,
