@@ -1,6 +1,7 @@
 use super::{DockerManifest, MANIFEST_NAME};
 use crate::session::{MoonSession, SessionResult};
 use clap::Args;
+use futures::stream::{self, StreamExt};
 use moon_common::Id;
 use moon_config::{GlobPath, PortablePath};
 use moon_pdk_api::{DefineDockerMetadataInput, ScaffoldDockerInput, ScaffoldDockerPhase};
@@ -15,6 +16,14 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tracing::{debug, instrument, trace, warn};
+
+fn configs_concurrency() -> usize {
+    std::env::var("MOON_SCAFFOLD_CONFIGS_CONCURRENCY")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(1)
+        .max(1)
+}
 
 #[derive(Args, Clone, Debug)]
 pub struct DockerScaffoldArgs {
@@ -150,7 +159,7 @@ impl ScaffoldWorkflow {
     }
 
     #[instrument(skip(self))]
-    async fn scaffold_project(&mut self, project: &Project) -> miette::Result<()> {
+    async fn scaffold_project(&self, project: &Project) -> miette::Result<()> {
         let docker_project_root = project.source.to_logical_path(self.get_skeleton_root());
         let toolchains = project.get_enabled_toolchains();
 
@@ -195,7 +204,7 @@ impl ScaffoldWorkflow {
     }
 
     #[instrument(skip(self))]
-    async fn scaffold_root(&mut self) -> miette::Result<()> {
+    async fn scaffold_root(&self) -> miette::Result<()> {
         let root_started = Instant::now();
         self.copy_files_from_plugins(&self.session.workspace_root, self.get_skeleton_root(), None)
             .await?;
@@ -222,7 +231,7 @@ impl ScaffoldWorkflow {
     }
 
     #[instrument(skip(self))]
-    async fn scaffold_configs_skeleton(&mut self) -> miette::Result<()> {
+    async fn scaffold_configs_skeleton(&self) -> miette::Result<()> {
         debug!(
             scaffold_dir = ?self.configs_root,
             "Scaffolding configs skeleton, copying configuration from all projects"
@@ -231,8 +240,25 @@ impl ScaffoldWorkflow {
         fs::create_dir_all(&self.configs_root)?;
 
         // Copy each project and mimic the folder structure
-        for project in self.project_graph.get_all()? {
-            self.scaffold_project(&project).await?;
+        let projects = self.project_graph.get_all()?;
+        let limit = configs_concurrency();
+        if limit <= 1 {
+            for project in projects {
+                self.scaffold_project(&project).await?;
+            }
+        } else {
+            let mut outcomes: Vec<(usize, miette::Result<()>)> =
+                stream::iter(projects.into_iter().enumerate())
+                    .map(|(index, project)| async move {
+                        (index, self.scaffold_project(&project).await)
+                    })
+                    .buffer_unordered(limit)
+                    .collect()
+                    .await;
+            outcomes.sort_by_key(|(index, _)| *index);
+            for (_, result) in outcomes {
+                result?;
+            }
         }
 
         self.scaffold_root().await?;
@@ -327,7 +353,8 @@ impl ScaffoldWorkflow {
 
         let metrics = self.metrics.lock().unwrap();
         eprintln!(
-            "MOON_SCAFFOLD_PROFILE config_projects={} source_projects={} metadata_calls={} metadata_unique_inputs={} metadata_reused_inputs={} metadata_ms={} copy_ms={} scaffold_plugin_ms={} root_ms={} config_copy_ms={} configs_ms={} sources_ms={} manifest_ms={}",
+            "MOON_SCAFFOLD_PROFILE configs_concurrency={} config_projects={} source_projects={} metadata_calls={} metadata_unique_inputs={} metadata_reused_inputs={} metadata_ms={} copy_ms={} scaffold_plugin_ms={} root_ms={} config_copy_ms={} configs_ms={} sources_ms={} manifest_ms={}",
+            configs_concurrency(),
             metrics.config_projects,
             metrics.source_projects,
             metrics.metadata_calls,

@@ -4978,6 +4978,7 @@ dependencies = [
  "clap_complete_nushell",
  "convert_case 0.11.0",
  "diff",
+ "futures",
  "indexmap",
  "iocraft",
  "miette 7.6.0",
