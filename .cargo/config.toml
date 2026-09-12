@@ -27,6 +27,7 @@ strip = "debuginfo"
 
 [profile.dist]
 inherits = "release"
+opt-level = 3
 
 [profile.bench]
 inherits = "release"
