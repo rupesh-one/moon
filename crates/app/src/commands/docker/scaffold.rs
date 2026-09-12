@@ -12,13 +12,30 @@ use starbase_styles::color;
 use starbase_utils::{fs, glob, json};
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 use tracing::{debug, instrument, trace, warn};
 
 #[derive(Args, Clone, Debug)]
 pub struct DockerScaffoldArgs {
     #[arg(required = true, help = "List of project IDs to copy sources for")]
     ids: Vec<Id>,
+}
+
+#[derive(Default)]
+struct ScaffoldMetrics {
+    config_projects: usize,
+    source_projects: usize,
+    metadata_calls: usize,
+    metadata_unique_inputs: FxHashSet<String>,
+    metadata_duration: Duration,
+    copy_duration: Duration,
+    scaffold_duration: Duration,
+    root_duration: Duration,
+    config_copy_duration: Duration,
+    configs_duration: Duration,
+    sources_duration: Duration,
+    manifest_duration: Duration,
 }
 
 struct ScaffoldWorkflow {
@@ -31,6 +48,7 @@ struct ScaffoldWorkflow {
     project_graph: Arc<ProjectGraph>,
     registry: Arc<ToolchainRegistry>,
     session: MoonSession,
+    metrics: Mutex<ScaffoldMetrics>,
 }
 
 impl ScaffoldWorkflow {
@@ -60,18 +78,28 @@ impl ScaffoldWorkflow {
         let workspace_scaffold = &self.session.workspace_config.docker.scaffold;
         let project_scaffold = project.map(|p| &p.config.docker.scaffold);
 
+        let metadata_started = Instant::now();
         let outputs = self
             .registry
-            .define_docker_metadata_all(|toolchain| DefineDockerMetadataInput {
-                context: self.registry.create_context(),
-                toolchain_config: match project {
-                    Some(proj) => self
-                        .registry
-                        .create_merged_config(&toolchain.id, &proj.config),
-                    None => self.registry.create_config(&toolchain.id),
-                },
+            .define_docker_metadata_all(|toolchain| {
+                let input = DefineDockerMetadataInput {
+                    context: self.registry.create_context(),
+                    toolchain_config: match project {
+                        Some(proj) => self
+                            .registry
+                            .create_merged_config(&toolchain.id, &proj.config),
+                        None => self.registry.create_config(&toolchain.id),
+                    },
+                };
+                let mut metrics = self.metrics.lock().unwrap();
+                metrics.metadata_calls += 1;
+                metrics
+                    .metadata_unique_inputs
+                    .insert(format!("{}:{input:?}", toolchain.id));
+                input
             })
             .await?;
+        self.metrics.lock().unwrap().metadata_duration += metadata_started.elapsed();
 
         let mut globs =
             FxHashSet::from_iter(outputs.into_iter().flat_map(|output| output.scaffold_globs));
@@ -114,7 +142,9 @@ impl ScaffoldWorkflow {
             .map(|glob| glob.to_string()),
         );
 
+        let copy_started = Instant::now();
         self.copy_files(globs.into_iter().collect(), src, dst)?;
+        self.metrics.lock().unwrap().copy_duration += copy_started.elapsed();
 
         Ok(())
     }
@@ -125,6 +155,10 @@ impl ScaffoldWorkflow {
         let toolchains = project.get_enabled_toolchains();
 
         fs::create_dir_all(&docker_project_root)?;
+        match self.phase {
+            ScaffoldDockerPhase::Configs => self.metrics.lock().unwrap().config_projects += 1,
+            ScaffoldDockerPhase::Sources => self.metrics.lock().unwrap().source_projects += 1,
+        }
 
         if self.phase == ScaffoldDockerPhase::Sources {
             debug!(
@@ -140,6 +174,7 @@ impl ScaffoldWorkflow {
             .await?;
 
         if !toolchains.is_empty() {
+            let scaffold_started = Instant::now();
             self.registry
                 .scaffold_docker_many(toolchains, |toolchain| ScaffoldDockerInput {
                     context: self.registry.create_context(),
@@ -153,6 +188,7 @@ impl ScaffoldWorkflow {
                         .create_merged_config(&toolchain.id, &project.config),
                 })
                 .await?;
+            self.metrics.lock().unwrap().scaffold_duration += scaffold_started.elapsed();
         }
 
         Ok(())
@@ -160,9 +196,11 @@ impl ScaffoldWorkflow {
 
     #[instrument(skip(self))]
     async fn scaffold_root(&mut self) -> miette::Result<()> {
+        let root_started = Instant::now();
         self.copy_files_from_plugins(&self.session.workspace_root, self.get_skeleton_root(), None)
             .await?;
 
+        let scaffold_started = Instant::now();
         self.registry
             .scaffold_docker_many(self.registry.get_plugin_ids(), |toolchain| {
                 ScaffoldDockerInput {
@@ -176,6 +214,9 @@ impl ScaffoldWorkflow {
                 }
             })
             .await?;
+        let mut metrics = self.metrics.lock().unwrap();
+        metrics.scaffold_duration += scaffold_started.elapsed();
+        metrics.root_duration += root_started.elapsed();
 
         Ok(())
     }
@@ -205,6 +246,7 @@ impl ScaffoldWorkflow {
         let cfg_dir_prefix = &self.session.config_loader.dir_prefix;
         let ext_glob = self.session.config_loader.get_ext_glob();
 
+        let config_copy_started = Instant::now();
         self.copy_files(
             vec![
                 format!("{cfg_dir_prefix}/*.{ext_glob}"),
@@ -213,6 +255,7 @@ impl ScaffoldWorkflow {
             &self.session.workspace_root,
             &self.configs_root,
         )?;
+        self.metrics.lock().unwrap().config_copy_duration += config_copy_started.elapsed();
 
         Ok(())
     }
@@ -269,10 +312,38 @@ impl ScaffoldWorkflow {
     }
 
     fn sync_manifest(&self) -> miette::Result<()> {
+        let manifest_started = Instant::now();
         json::write_file(self.sources_root.join(MANIFEST_NAME), &self.manifest, true)?;
         json::write_file(self.configs_root.join(MANIFEST_NAME), &self.manifest, true)?;
+        self.metrics.lock().unwrap().manifest_duration += manifest_started.elapsed();
 
         Ok(())
+    }
+
+    fn print_metrics(&self) {
+        if std::env::var_os("MOON_SCAFFOLD_PROFILE").is_none() {
+            return;
+        }
+
+        let metrics = self.metrics.lock().unwrap();
+        eprintln!(
+            "MOON_SCAFFOLD_PROFILE config_projects={} source_projects={} metadata_calls={} metadata_unique_inputs={} metadata_reused_inputs={} metadata_ms={} copy_ms={} scaffold_plugin_ms={} root_ms={} config_copy_ms={} configs_ms={} sources_ms={} manifest_ms={}",
+            metrics.config_projects,
+            metrics.source_projects,
+            metrics.metadata_calls,
+            metrics.metadata_unique_inputs.len(),
+            metrics
+                .metadata_calls
+                .saturating_sub(metrics.metadata_unique_inputs.len()),
+            metrics.metadata_duration.as_millis(),
+            metrics.copy_duration.as_millis(),
+            metrics.scaffold_duration.as_millis(),
+            metrics.root_duration.as_millis(),
+            metrics.config_copy_duration.as_millis(),
+            metrics.configs_duration.as_millis(),
+            metrics.sources_duration.as_millis(),
+            metrics.manifest_duration.as_millis(),
+        );
     }
 }
 
@@ -345,15 +416,21 @@ pub async fn scaffold(session: MoonSession, args: DockerScaffoldArgs) -> Session
         project_graph: session.get_project_graph().await?,
         registry: session.get_toolchain_registry().await?,
         session,
+        metrics: Mutex::new(ScaffoldMetrics::default()),
     };
 
     workflow.phase = ScaffoldDockerPhase::Configs;
+    let configs_started = Instant::now();
     workflow.scaffold_configs_skeleton().await?;
+    workflow.metrics.lock().unwrap().configs_duration = configs_started.elapsed();
 
     workflow.phase = ScaffoldDockerPhase::Sources;
+    let sources_started = Instant::now();
     workflow.scaffold_sources_skeleton().await?;
+    workflow.metrics.lock().unwrap().sources_duration = sources_started.elapsed();
 
     workflow.sync_manifest()?;
+    workflow.print_metrics();
 
     Ok(None)
 }
